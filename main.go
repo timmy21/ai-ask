@@ -36,6 +36,40 @@ type ChatResponse struct {
 	Choices []ChatChoice `json:"choices"`
 }
 
+type ClaudeRequest struct {
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	MaxTokens int       `json:"max_tokens"`
+	System    string    `json:"system,omitempty"`
+}
+
+type ClaudeResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+type GeminiPart struct {
+	Text string `json:"text"`
+}
+
+type GeminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiRequest struct {
+	Contents          []GeminiContent `json:"contents"`
+	SystemInstruction *GeminiContent  `json:"systemInstruction,omitempty"`
+}
+
+type GeminiResponse struct {
+	Candidates []struct {
+		Content GeminiContent `json:"content"`
+	} `json:"candidates"`
+}
+
 func main() {
 	baseURL := os.Getenv("AI_ASK_BASE_URL")
 	if baseURL == "" {
@@ -53,6 +87,11 @@ func main() {
 	if model == "" {
 		fmt.Fprintln(os.Stderr, "Error: AI_ASK_MODEL is not set")
 		os.Exit(1)
+	}
+
+	protocol := strings.ToLower(os.Getenv("AI_ASK_PROTOCOL"))
+	if protocol == "" {
+		protocol = "openai"
 	}
 
 	// Check if data is being piped to stdin
@@ -81,7 +120,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := chat(baseURL, apiKey, model, question); err != nil {
+	if err := chat(protocol, baseURL, apiKey, model, question); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -156,7 +195,7 @@ func getOSInfo() string {
 	return "linux"
 }
 
-func chat(baseURL, apiKey, model, question string) error {
+func getSystemPrompt() string {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "sh"
@@ -172,71 +211,43 @@ func chat(baseURL, apiKey, model, question string) error {
 	systemPrompt := strings.ReplaceAll(systemPromptTemplate, "{{.OS}}", osInfo)
 	systemPrompt = strings.ReplaceAll(systemPrompt, "{{.Arch}}", runtime.GOARCH)
 	systemPrompt = strings.ReplaceAll(systemPrompt, "{{.Shell}}", shell)
+	return systemPrompt
+}
 
+func chat(protocol, baseURL, apiKey, model, question string) error {
 	isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 	if isTerminal {
 		fmt.Print("Thinking...")
 	}
 
-	messages := []Message{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: question},
+	var content string
+	var err error
+
+	switch protocol {
+	case "claude":
+		content, err = callClaude(baseURL, apiKey, model, question)
+	case "gemini":
+		content, err = callGemini(baseURL, apiKey, model, question)
+	default:
+		content, err = callOpenAI(baseURL, apiKey, model, question)
 	}
 
-	reqBody := ChatRequest{
-		Model:    model,
-		Messages: messages,
-		Stream:   false,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
-	}
-
-	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error: %s - %s", resp.Status, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return err
-	}
-
-	if len(chatResp.Choices) == 0 {
-		fmt.Println("No response")
-		return nil
-	}
-
-	content := chatResp.Choices[0].Message.Content
-	if !isTerminal {
-		fmt.Println(content)
-		return nil
 	}
 
 	// Clear "Thinking..." line
 	fmt.Print("\r\033[K")
+
+	if content == "" {
+		fmt.Println("No response")
+		return nil
+	}
+
+	if !isTerminal {
+		fmt.Println(content)
+		return nil
+	}
 
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStylePath("dark"),
@@ -255,4 +266,180 @@ func chat(baseURL, apiKey, model, question string) error {
 	}
 	fmt.Println(out)
 	return nil
+}
+
+func callOpenAI(baseURL, apiKey, model, question string) (string, error) {
+	systemPrompt := getSystemPrompt()
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: question},
+	}
+	reqBody := ChatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   false,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	url := baseURL + "/v1/chat/completions"
+	if strings.HasSuffix(baseURL, "/v1") || strings.HasSuffix(baseURL, "/v1/") {
+		url = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var chatResp ChatResponse
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return "", err
+	}
+	if len(chatResp.Choices) > 0 {
+		return chatResp.Choices[0].Message.Content, nil
+	}
+	return "", nil
+}
+
+func callClaude(baseURL, apiKey, model, question string) (string, error) {
+	systemPrompt := getSystemPrompt()
+	messages := []Message{
+		{Role: "user", Content: question},
+	}
+
+	reqBody := ClaudeRequest{
+		Model:     model,
+		Messages:  messages,
+		MaxTokens: 4096,
+		System:    systemPrompt,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	url := baseURL + "/v1/messages"
+	if strings.HasSuffix(baseURL, "/v1") || strings.HasSuffix(baseURL, "/v1/") {
+		url = strings.TrimSuffix(baseURL, "/") + "/messages"
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var claudeResp ClaudeResponse
+	if err := json.Unmarshal(body, &claudeResp); err != nil {
+		return "", err
+	}
+
+	var result strings.Builder
+	for _, block := range claudeResp.Content {
+		if block.Type == "text" || (block.Type == "" && block.Text != "") {
+			result.WriteString(block.Text)
+		}
+	}
+
+	if result.Len() > 0 {
+		return result.String(), nil
+	}
+	return "", nil
+}
+
+func callGemini(baseURL, apiKey, model, question string) (string, error) {
+	systemPrompt := getSystemPrompt()
+
+	reqBody := GeminiRequest{
+		Contents: []GeminiContent{
+			{
+				Role: "user",
+				Parts: []GeminiPart{
+					{Text: question},
+				},
+			},
+		},
+		SystemInstruction: &GeminiContent{
+			Parts: []GeminiPart{
+				{Text: systemPrompt},
+			},
+		},
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", baseURL, model, apiKey)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var geminiResp GeminiResponse
+	if err := json.Unmarshal(body, &geminiResp); err != nil {
+		return "", err
+	}
+	if len(geminiResp.Candidates) > 0 {
+		parts := geminiResp.Candidates[0].Content.Parts
+		if len(parts) > 0 {
+			return parts[len(parts)-1].Text, nil
+		}
+	}
+	return "", nil
 }
