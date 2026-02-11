@@ -3,13 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
+	"text/template"
+	"time"
 
 	"github.com/charmbracelet/glamour"
 	"golang.org/x/term"
@@ -36,6 +40,49 @@ type ChatResponse struct {
 	Choices []ChatChoice `json:"choices"`
 }
 
+type ClaudeRequest struct {
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	MaxTokens int       `json:"max_tokens"`
+	System    string    `json:"system,omitempty"`
+}
+
+type ClaudeResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+type GeminiPart struct {
+	Text    string `json:"text,omitempty"`
+	Thought bool   `json:"thought,omitempty"`
+}
+
+type GeminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiRequest struct {
+	Contents          []GeminiContent `json:"contents"`
+	SystemInstruction *GeminiContent  `json:"systemInstruction,omitempty"`
+}
+
+type GeminiResponse struct {
+	Candidates []struct {
+		Content *GeminiContent `json:"content"`
+	} `json:"candidates"`
+}
+
+const requestTimeout = 90 * time.Second
+
+var httpClient = &http.Client{
+	Timeout: requestTimeout,
+}
+
+var systemPromptTmpl = template.Must(template.New("systemPrompt").Parse(systemPromptTemplate))
+
 func main() {
 	baseURL := os.Getenv("AI_ASK_BASE_URL")
 	if baseURL == "" {
@@ -55,20 +102,39 @@ func main() {
 		os.Exit(1)
 	}
 
+	protocol := strings.ToLower(os.Getenv("AI_ASK_PROTOCOL"))
+	if protocol == "" {
+		protocol = "openai"
+	}
+	switch protocol {
+	case "openai", "claude", "gemini":
+	default:
+		fmt.Fprintf(os.Stderr, "Error: unsupported AI_ASK_PROTOCOL %q (supported: openai, claude, gemini)\n", protocol)
+		os.Exit(1)
+	}
+
 	// Check if data is being piped to stdin
-	stat, _ := os.Stdin.Stat()
-	hasPipe := (stat.Mode() & os.ModeCharDevice) == 0
+	stat, err := os.Stdin.Stat()
+	hasPipe := err == nil && (stat.Mode()&os.ModeCharDevice) == 0
 	hasArgs := len(os.Args) >= 2
 
 	var question string
 	if hasPipe && hasArgs {
 		// Case 1: cat error.log | ask "分析这个错误"
-		pipeData, _ := io.ReadAll(os.Stdin)
+		pipeData, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to read stdin: %v\n", err)
+			os.Exit(1)
+		}
 		argQuestion := strings.Join(os.Args[1:], " ")
 		question = fmt.Sprintf("%s\n\n```\n%s```", argQuestion, string(pipeData))
 	} else if hasPipe {
 		// Case 2: echo "问题" | ask
-		pipeData, _ := io.ReadAll(os.Stdin)
+		pipeData, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to read stdin: %v\n", err)
+			os.Exit(1)
+		}
 		question = string(pipeData)
 	} else if hasArgs {
 		// Case 3: ask "how to install uv"
@@ -81,7 +147,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := chat(baseURL, apiKey, model, question); err != nil {
+	if err := chat(protocol, baseURL, apiKey, model, question); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -143,6 +209,9 @@ func getOSInfo() string {
 			version = strings.Trim(strings.TrimPrefix(line, "VERSION="), "\"")
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return "linux"
+	}
 
 	if prettyName != "" {
 		return prettyName
@@ -156,7 +225,7 @@ func getOSInfo() string {
 	return "linux"
 }
 
-func chat(baseURL, apiKey, model, question string) error {
+func getSystemPrompt() string {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "sh"
@@ -166,77 +235,81 @@ func chat(baseURL, apiKey, model, question string) error {
 		shell = shell[idx+1:]
 	}
 
-	osInfo := getOSInfo()
+	var out bytes.Buffer
+	data := struct {
+		OS    string
+		Arch  string
+		Shell string
+	}{
+		OS:    getOSInfo(),
+		Arch:  runtime.GOARCH,
+		Shell: shell,
+	}
+	if err := systemPromptTmpl.Execute(&out, data); err != nil {
+		return systemPromptTemplate
+	}
+	return out.String()
+}
 
-	// Replace template variables
-	systemPrompt := strings.ReplaceAll(systemPromptTemplate, "{{.OS}}", osInfo)
-	systemPrompt = strings.ReplaceAll(systemPrompt, "{{.Arch}}", runtime.GOARCH)
-	systemPrompt = strings.ReplaceAll(systemPrompt, "{{.Shell}}", shell)
+func buildSystemFallbackPrefix() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "sh"
+	}
+	if idx := strings.LastIndex(shell, "/"); idx != -1 {
+		shell = shell[idx+1:]
+	}
 
+	return fmt.Sprintf(
+		"You MUST only provide solutions for %s, using %s syntax, and never include other operating systems.",
+		getOSInfo(),
+		shell,
+	)
+}
+
+func withSystemFallbackInUser(question string) string {
+	prefix := buildSystemFallbackPrefix()
+	if strings.TrimSpace(question) == "" {
+		return prefix
+	}
+	return prefix + "\n\n" + question
+}
+
+func chat(protocol, baseURL, apiKey, model, question string) error {
 	isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 	if isTerminal {
 		fmt.Print("Thinking...")
 	}
 
-	messages := []Message{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: question},
+	var content string
+	var err error
+
+	switch protocol {
+	case "claude":
+		content, err = callClaude(baseURL, apiKey, model, question)
+	case "gemini":
+		content, err = callGemini(baseURL, apiKey, model, question)
+	default:
+		content, err = callOpenAI(baseURL, apiKey, model, question)
 	}
 
-	reqBody := ChatRequest{
-		Model:    model,
-		Messages: messages,
-		Stream:   false,
+	if isTerminal {
+		fmt.Print("\r\033[K")
 	}
 
-	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error: %s - %s", resp.Status, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return err
-	}
-
-	if len(chatResp.Choices) == 0 {
+	if content == "" {
 		fmt.Println("No response")
 		return nil
 	}
 
-	content := chatResp.Choices[0].Message.Content
 	if !isTerminal {
 		fmt.Println(content)
 		return nil
 	}
-
-	// Clear "Thinking..." line
-	fmt.Print("\r\033[K")
 
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStylePath("dark"),
@@ -255,4 +328,183 @@ func chat(baseURL, apiKey, model, question string) error {
 	}
 	fmt.Println(out)
 	return nil
+}
+
+func sanitizeForError(text string, sensitiveValues ...string) string {
+	sanitized := text
+	for _, v := range sensitiveValues {
+		if v == "" {
+			continue
+		}
+		sanitized = strings.ReplaceAll(sanitized, v, "[REDACTED]")
+	}
+	return sanitized
+}
+
+func doJSONRequest(ctx context.Context, method, url string, body []byte, headers map[string]string, sensitiveValues ...string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("API error: %s - %s", resp.Status, sanitizeForError(string(respBody), sensitiveValues...))
+	}
+	return respBody, nil
+}
+
+func callOpenAI(baseURL, apiKey, model, question string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	systemPrompt := getSystemPrompt()
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: question},
+	}
+	reqBody := ChatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   false,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	body, err := doJSONRequest(ctx, http.MethodPost, baseURL, jsonData, map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey,
+	}, apiKey)
+	if err != nil {
+		return "", err
+	}
+
+	var chatResp ChatResponse
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return "", err
+	}
+	if len(chatResp.Choices) > 0 {
+		return chatResp.Choices[0].Message.Content, nil
+	}
+	return "", nil
+}
+
+func callClaude(baseURL, apiKey, model, question string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	systemPrompt := getSystemPrompt()
+	messages := []Message{
+		{Role: "user", Content: withSystemFallbackInUser(question)},
+	}
+
+	reqBody := ClaudeRequest{
+		Model:     model,
+		Messages:  messages,
+		MaxTokens: 4096,
+		System:    systemPrompt,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	body, err := doJSONRequest(ctx, http.MethodPost, baseURL, jsonData, map[string]string{
+		"Content-Type":      "application/json",
+		"x-api-key":         apiKey,
+		"anthropic-version": "2023-06-01",
+	}, apiKey)
+	if err != nil {
+		return "", err
+	}
+
+	var claudeResp ClaudeResponse
+	if err := json.Unmarshal(body, &claudeResp); err != nil {
+		return "", err
+	}
+
+	var result strings.Builder
+	for _, block := range claudeResp.Content {
+		if block.Type == "text" || (block.Type == "" && block.Text != "") {
+			result.WriteString(block.Text)
+		}
+	}
+
+	if result.Len() > 0 {
+		return result.String(), nil
+	}
+	return "", nil
+}
+
+func callGemini(baseURL, apiKey, model, question string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	systemPrompt := getSystemPrompt()
+
+	reqBody := GeminiRequest{
+		Contents: []GeminiContent{
+			{
+				Role: "user",
+				Parts: []GeminiPart{
+					{Text: withSystemFallbackInUser(question)},
+				},
+			},
+		},
+		SystemInstruction: &GeminiContent{
+			Role: "system",
+			Parts: []GeminiPart{
+				{Text: systemPrompt},
+			},
+		},
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	fullUrl, err := url.JoinPath(baseURL, "models", fmt.Sprintf("%s:generateContent", model))
+	if err != nil {
+		return "", err
+	}
+	body, err := doJSONRequest(ctx, http.MethodPost, fullUrl, jsonData, map[string]string{
+		"Content-Type":   "application/json",
+		"x-goog-api-key": apiKey,
+	}, apiKey)
+	if err != nil {
+		return "", err
+	}
+
+	var resp GeminiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+		return "", nil
+	}
+
+	var texts []string
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if part.Text != "" {
+			if part.Thought {
+				continue
+			}
+			texts = append(texts, part.Text)
+		}
+	}
+
+	return strings.Join(texts, ""), nil
 }
