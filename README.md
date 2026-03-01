@@ -1,6 +1,6 @@
 # ai-ask
 
-A command-line AI assistant for developers that provides quick, concise answers to technical questions using OpenAI-compatible APIs.
+A command-line AI assistant for developers. Supports `openai`, `claude`, and `gemini` protocols.
 
 ## Build
 
@@ -13,48 +13,50 @@ A command-line AI assistant for developers that provides quick, concise answers 
 go build -o ask main.go
 ```
 
-### Install to system
+## Quick Setup
+
+`ai-ask` reads 4 env vars:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AI_ASK_PROTOCOL` | No | Protocol: `openai` (default), `claude`, `gemini` |
+| `AI_ASK_BASE_URL` | Yes | Request endpoint/base URL (depends on protocol) |
+| `AI_ASK_API_KEY` | Yes | API key |
+| `AI_ASK_MODEL` | Yes | Model name |
+
+### 1) OpenAI protocol (default)
 
 ```bash
-# Build and install to $GOPATH/bin
-go install
-
-# Or manually copy to a directory in your PATH
-sudo cp ask /usr/local/bin/
-```
-
-## Environment Variables Setup
-
-Three environment variables are required:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `AI_ASK_BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
-| `AI_ASK_API_KEY` | API authentication key | `sk-xxx...` |
-| `AI_ASK_MODEL` | Model name to use | `gpt-4` or `gpt-3.5-turbo` |
-
-### Configuration
-
-Add to your shell configuration file (`~/.bashrc`, `~/.zshrc`, etc.):
-
-```bash
-export AI_ASK_BASE_URL="https://api.openai.com/v1"
-export AI_ASK_API_KEY="your-api-key-here"
-export AI_ASK_MODEL="gpt-4"
-```
-
-Then reload your shell:
-
-```bash
-source ~/.zshrc  # or ~/.bashrc
-```
-
-### Alternative: Per-session setup
-
-```bash
-export AI_ASK_BASE_URL="https://api.openai.com/v1"
+export AI_ASK_PROTOCOL="openai"
+export AI_ASK_BASE_URL="https://api.openai.com/v1/chat/completions"
 export AI_ASK_API_KEY="sk-xxx..."
-export AI_ASK_MODEL="gpt-4"
+export AI_ASK_MODEL="gpt-4o-mini"
+```
+
+### 2) Claude protocol
+
+```bash
+export AI_ASK_PROTOCOL="claude"
+export AI_ASK_BASE_URL="https://api.anthropic.com/v1/messages"
+export AI_ASK_API_KEY="sk-ant-xxx..."
+export AI_ASK_MODEL="claude-3-5-sonnet-20241022"
+```
+
+### 3) Gemini protocol
+
+```bash
+export AI_ASK_PROTOCOL="gemini"
+export AI_ASK_BASE_URL="https://generativelanguage.googleapis.com/v1beta"
+export AI_ASK_API_KEY="AIzaSy..."
+export AI_ASK_MODEL="gemini-2.0-flash"
+```
+
+### Persist to shell profile
+
+Add one of the protocol blocks above to `~/.zshrc` or `~/.bashrc`, then reload:
+
+```bash
+source ~/.zshrc
 ```
 
 ## Usage
